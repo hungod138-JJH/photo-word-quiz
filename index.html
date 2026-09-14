@@ -144,16 +144,29 @@ function readAsDataUrl(file) {
   });
 }
 
-function downscale(dataUrl, maxW) {
+function preprocessImage(dataUrl, maxW) {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       const scale = Math.min(1, maxW / img.width);
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
       const canvas = document.createElement('canvas');
-      canvas.width = img.width * scale;
-      canvas.height = img.height * scale;
-      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
-      resolve(canvas.toDataURL('image/jpeg', 0.85));
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      const imgData = ctx.getImageData(0, 0, w, h);
+      const data = imgData.data;
+      const contrast = 1.5; // 1보다 크면 대비 강화 (배경 비침/형광펜 노이즈 완화)
+      for (let i = 0; i < data.length; i += 4) {
+        const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        let v = (gray - 150) * contrast + 150;
+        v = Math.max(0, Math.min(255, v));
+        data[i] = data[i + 1] = data[i + 2] = v;
+      }
+      ctx.putImageData(imgData, 0, 0);
+      resolve(canvas.toDataURL('image/jpeg', 0.92));
     };
     img.src = dataUrl;
   });
@@ -163,6 +176,7 @@ async function processPhotos(dataUrls) {
   const total = dataUrls.length;
   let allEntries = [];
   let failedCount = 0;
+  let rawTexts = [];
 
   for (let i = 0; i < total; i++) {
     render(`
@@ -176,7 +190,7 @@ async function processPhotos(dataUrls) {
       </div>
     `);
     try {
-      const small = await downscale(dataUrls[i], 1000);
+      const small = await preprocessImage(dataUrls[i], 1600);
       const result = await Tesseract.recognize(small, 'eng', {
         logger: (m) => {
           if (m.status === 'recognizing text') {
@@ -185,14 +199,16 @@ async function processPhotos(dataUrls) {
           }
         }
       });
-      const entries = parseMultipleEntries(result.data.text.trim()).filter(en => en.word && en.example);
+      const rawText = result.data.text.trim();
+      rawTexts.push(rawText);
+      const entries = parseMultipleEntries(rawText).filter(en => en.word && en.example);
       allEntries = allEntries.concat(entries);
     } catch (err) {
       failedCount++;
     }
   }
 
-  saveEntries(allEntries, failedCount);
+  saveEntries(allEntries, failedCount, rawTexts);
 }
 
 function guessWordAndExampleFallback(text) {
@@ -205,7 +221,7 @@ function guessWordAndExampleFallback(text) {
 }
 
 function parseMultipleEntries(text) {
-  const wordRegex = /\b([A-Za-z][A-Za-z'\-]{1,20})\s*\(\s*(v|n|adj|adv|prep|conj|pron|interj)\s*\)/gi;
+  const wordRegex = /\b([A-Za-z][A-Za-z'\-]{1,20})\s*[^\w\s(]{0,3}\s*\(\s*(v\.?|n\.?|adj\.?|adv\.?|prep\.?|conj\.?|pron\.?|interj\.?)\s*\)/gi;
   const words = [];
   let m;
   while ((m = wordRegex.exec(text)) !== null) words.push(m[1]);
@@ -226,7 +242,7 @@ function parseMultipleEntries(text) {
   return pairs;
 }
 
-function saveEntries(entries, failedCount) {
+function saveEntries(entries, failedCount, rawTexts) {
   entries.forEach(en => {
     const entry = { id: Date.now() + '-' + Math.random().toString(36).slice(2, 7), word: en.word, example: en.example, createdAt: Date.now() };
     allWords.push(entry);
@@ -235,6 +251,9 @@ function saveEntries(entries, failedCount) {
   saveBank();
   const previewHtml = entries.map(en => `
     <div class="word-row"><div><div class="w">${esc(en.word)}</div><div class="e">${esc(en.example)}</div></div></div>
+  `).join('');
+  const rawHtml = (rawTexts || []).map((t, i) => `
+    <div style="margin-bottom:10px;"><div style="font-size:11.5px;font-weight:700;color:#7A8AA3;margin-bottom:3px;">사진 ${i + 1}</div><pre style="white-space:pre-wrap;font-size:12px;background:#F7FAFD;border-radius:8px;padding:8px;margin:0;">${esc(t)}</pre></div>
   `).join('');
   render(`
     <div class="card">
@@ -245,6 +264,7 @@ function saveEntries(entries, failedCount) {
       <button class="btn btn-primary" onclick="goCapture()">📸 계속 찍기 / 선택하기</button>
       <button class="btn btn-secondary" onclick="goQuizSetup()">✏️ 바로 퀴즈 풀기</button>
       <button class="btn btn-secondary" onclick="goHome()">처음으로</button>
+      ${rawHtml ? `<details style="margin-top:14px;"><summary style="font-size:12.5px;color:#7A8AA3;cursor:pointer;">인식된 원문 보기 (문제 진단용)</summary>${rawHtml}</details>` : ''}
     </div>
   `);
 }
