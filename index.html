@@ -172,16 +172,29 @@ function preprocessAndSplit(dataUrl, maxW, targetBandHeight) {
       // 세로로 긴 사진은 여러 구간으로 나눠서 각각 인식 (한 번에 넣으면 아래쪽을 건너뛰는 경우가 있어요)
       const bandCount = Math.max(1, Math.round(h / targetBandHeight));
       const bandH = Math.ceil(h / bandCount);
+      const leftFrac = 0.34; // 단어(품사) 열은 대략 왼쪽 34%
       const bands = [];
       for (let i = 0; i < bandCount; i++) {
         const y = i * bandH;
         const bh = Math.min(bandH, h - y);
         if (bh <= 0) continue;
-        const bandCanvas = document.createElement('canvas');
-        bandCanvas.width = w;
-        bandCanvas.height = bh;
-        bandCanvas.getContext('2d').drawImage(main, 0, y, w, bh, 0, 0, w, bh);
-        bands.push(bandCanvas.toDataURL('image/jpeg', 0.92));
+
+        // 왼쪽: 단어+품사 열
+        const leftW = Math.round(w * leftFrac);
+        const leftCanvas = document.createElement('canvas');
+        leftCanvas.width = leftW;
+        leftCanvas.height = bh;
+        leftCanvas.getContext('2d').drawImage(main, 0, y, leftW, bh, 0, 0, leftW, bh);
+
+        // 오른쪽: 뜻+예문 열 (경계에서 글자가 잘리지 않도록 살짝 겹치게 시작)
+        const rightStart = Math.round(w * leftFrac * 0.92);
+        const rightW = w - rightStart;
+        const rightCanvas = document.createElement('canvas');
+        rightCanvas.width = rightW;
+        rightCanvas.height = bh;
+        rightCanvas.getContext('2d').drawImage(main, rightStart, y, rightW, bh, 0, 0, rightW, bh);
+
+        bands.push({ left: leftCanvas.toDataURL('image/jpeg', 0.92), right: rightCanvas.toDataURL('image/jpeg', 0.92) });
       }
       resolve(bands);
     };
@@ -198,7 +211,7 @@ async function processPhotos(dataUrls) {
   for (let i = 0; i < totalPhotos; i++) {
     let bands;
     try {
-      bands = await preprocessAndSplit(dataUrls[i], 1300, 550);
+      bands = await preprocessAndSplit(dataUrls[i], 1300, 350);
     } catch (err) {
       failedCount++;
       continue;
@@ -216,19 +229,27 @@ async function processPhotos(dataUrls) {
         </div>
       `);
       try {
-        const result = await Tesseract.recognize(bands[j], 'eng', {
-          logger: (m) => {
-            if (m.status === 'recognizing text') {
-              const bar = document.getElementById('ocrBar');
-              if (bar) bar.style.width = Math.round(m.progress * 100) + '%';
-            }
+        const updateBar = (m) => {
+          if (m.status === 'recognizing text') {
+            const bar = document.getElementById('ocrBar');
+            if (bar) bar.style.width = Math.round(m.progress * 100) + '%';
           }
-        });
-        const bandText = result.data.text.trim();
-        photoRaw.push(bandText);
-        // 구간별로 바로 단어-예문을 매칭해서, 한 구간의 OCR 오류가 다른 구간 결과까지 밀리게 하지 않아요
-        const entries = parseMultipleEntries(bandText).filter(en => en.word && en.example);
-        allEntries = allEntries.concat(entries);
+        };
+        // 단어 열과 뜻/예문 열을 따로 인식해서 두 열이 뒤섞여 읽히는 문제를 줄여요
+        const [leftResult, rightResult] = await Promise.all([
+          Tesseract.recognize(bands[j].left, 'eng', { logger: updateBar }),
+          Tesseract.recognize(bands[j].right, 'eng', { logger: () => {} })
+        ]);
+        const leftText = leftResult.data.text.trim();
+        const rightText = rightResult.data.text.trim();
+        photoRaw.push(`[단어열]\n${leftText}\n[예문열]\n${rightText}`);
+
+        const words = extractWords(leftText);
+        const examples = extractExamples(rightText);
+        const count = Math.min(words.length, examples.length);
+        for (let k = 0; k < count; k++) {
+          if (words[k] && examples[k]) allEntries.push({ word: words[k], example: examples[k] });
+        }
       } catch (err) {
         // 이 구간만 건너뛰고 계속 진행
       }
@@ -236,43 +257,32 @@ async function processPhotos(dataUrls) {
     rawTexts.push(photoRaw.join('\n---\n'));
   }
 
-  saveEntries(allEntries, failedCount, rawTexts);
+  // 같은 단어가 여러 구간 경계에 걸쳐 중복 인식된 경우 정리 (먼저 찾은 것을 우선)
+  const seen = new Set();
+  const deduped = [];
+  allEntries.forEach(en => {
+    const key = en.word.toLowerCase();
+    if (!seen.has(key)) { seen.add(key); deduped.push(en); }
+  });
+
+  saveEntries(deduped, failedCount, rawTexts);
 }
 
-function guessWordAndExampleFallback(text) {
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  if (lines.length < 2) return null;
-  let wordLine = lines.find(l => l.split(/\s+/).length <= 2);
-  if (!wordLine) return null;
-  const word = wordLine.replace(/[^a-zA-Z' ]/g, '').trim().split(/\s+/)[0] || '';
-  const exampleLine = lines.find(l => l !== wordLine && l.split(/\s+/).length >= 4);
-  if (!word || word.length < 2 || !exampleLine) return null;
-  return { word, example: exampleLine };
-}
-
-function parseMultipleEntries(rawText) {
-  // OCR이 대괄호 [ ] 를 중괄호 { } 로 잘못 읽는 경우가 많아 보정
-  const text = rawText.replace(/\{/g, '[').replace(/\}/g, ']');
+function extractWords(text) {
   const wordRegex = /\b([A-Za-z][A-Za-z'\-]{1,20})\s*[^\w\s(]{0,3}\s*\(\s*(v\.?|n\.?|adj\.?|adv\.?|prep\.?|conj\.?|pron\.?|interj\.?)\s*\)/gi;
   const words = [];
   let m;
   while ((m = wordRegex.exec(text)) !== null) words.push(m[1]);
+  return words;
+}
 
+function extractExamples(text) {
+  const normalized = text.replace(/\{/g, '[').replace(/\}/g, ']');
   const bracketRegex = /\[([^\[\]]+)\]/g;
   const examples = [];
-  let m2;
-  while ((m2 = bracketRegex.exec(text)) !== null) examples.push(m2[1].trim().replace(/\s+/g, ' '));
-
-  if (words.length === 0 && examples.length === 0) {
-    const guess = guessWordAndExampleFallback(text);
-    return guess ? [guess] : [];
-  }
-  const count = Math.max(words.length, examples.length);
-  const pairs = [];
-  for (let i = 0; i < count; i++) {
-    pairs.push({ word: words[i] || '', example: examples[i] || '' });
-  }
-  return pairs;
+  let m;
+  while ((m = bracketRegex.exec(normalized)) !== null) examples.push(m[1].trim().replace(/\s+/g, ' '));
+  return examples;
 }
 
 function saveEntries(entries, failedCount, rawTexts) {
