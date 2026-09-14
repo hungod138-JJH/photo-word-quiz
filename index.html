@@ -119,20 +119,29 @@ function goCapture() {
   render(`
     <span class="link-back" onclick="goHome()">← 처음으로</span>
     <div class="card">
-      <label class="field-label">단어가 보이는 사진을 찍어주세요</label>
-      <input type="file" id="fileInput" accept="image/*" capture="environment">
-      <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">📸 사진 찍기 / 선택하기</button>
+      <label class="field-label">단어가 보이는 사진을 준비해주세요</label>
+      <input type="file" id="fileInputCamera" accept="image/*" capture="environment">
+      <input type="file" id="fileInputGallery" accept="image/*" multiple>
+      <button class="btn btn-primary" onclick="document.getElementById('fileInputCamera').click()">📸 새로 사진 찍기</button>
+      <button class="btn btn-secondary" onclick="document.getElementById('fileInputGallery').click()">🖼️ 저장된 사진에서 선택 (여러 장 가능)</button>
     </div>
   `);
-  document.getElementById('fileInput').addEventListener('change', onPhoto);
+  document.getElementById('fileInputCamera').addEventListener('change', onPhotos);
+  document.getElementById('fileInputGallery').addEventListener('change', onPhotos);
 }
 
-function onPhoto(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => runOcr(reader.result);
-  reader.readAsDataURL(file);
+function onPhotos(e) {
+  const files = Array.from(e.target.files || []);
+  if (files.length === 0) return;
+  Promise.all(files.map(readAsDataUrl)).then(processPhotos);
+}
+
+function readAsDataUrl(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.readAsDataURL(file);
+  });
 }
 
 function downscale(dataUrl, maxW) {
@@ -150,36 +159,40 @@ function downscale(dataUrl, maxW) {
   });
 }
 
-async function runOcr(dataUrl) {
-  render(`
-    <div class="card">
-      <img id="preview" src="${dataUrl}">
-      <div class="status">
-        <div class="spinner"></div>
-        <div id="ocrMsg">사진 속 글자를 읽는 중이에요...</div>
-        <div class="progress-bar"><div class="progress-fill" id="ocrBar" style="width:0%"></div></div>
-      </div>
-    </div>
-  `);
-  const small = await downscale(dataUrl, 1000);
-  try {
-    const result = await Tesseract.recognize(small, 'eng', {
-      logger: (m) => {
-        if (m.status === 'recognizing text') {
-          document.getElementById('ocrBar').style.width = Math.round(m.progress * 100) + '%';
-        }
-      }
-    });
-    ocrRaw = result.data.text.trim();
-    showReview(dataUrl);
-  } catch (err) {
+async function processPhotos(dataUrls) {
+  const total = dataUrls.length;
+  let allEntries = [];
+  let failedCount = 0;
+
+  for (let i = 0; i < total; i++) {
     render(`
       <div class="card">
-        <div class="empty">글자를 읽지 못했어요. 더 밝고 선명한 사진으로 다시 시도해주세요.</div>
-        <button class="btn btn-secondary" onclick="goCapture()">다시 찍기</button>
+        <img id="preview" src="${dataUrls[i]}">
+        <div class="status">
+          <div class="spinner"></div>
+          <div id="ocrMsg">사진 속 글자를 읽는 중이에요 (${i + 1} / ${total})</div>
+          <div class="progress-bar"><div class="progress-fill" id="ocrBar" style="width:0%"></div></div>
+        </div>
       </div>
     `);
+    try {
+      const small = await downscale(dataUrls[i], 1000);
+      const result = await Tesseract.recognize(small, 'eng', {
+        logger: (m) => {
+          if (m.status === 'recognizing text') {
+            const bar = document.getElementById('ocrBar');
+            if (bar) bar.style.width = Math.round(m.progress * 100) + '%';
+          }
+        }
+      });
+      const entries = parseMultipleEntries(result.data.text.trim()).filter(en => en.word && en.example);
+      allEntries = allEntries.concat(entries);
+    } catch (err) {
+      failedCount++;
+    }
   }
+
+  saveEntries(allEntries, failedCount);
 }
 
 function guessWordAndExampleFallback(text) {
@@ -213,8 +226,7 @@ function parseMultipleEntries(text) {
   return pairs;
 }
 
-function showReview(dataUrl) {
-  const entries = parseMultipleEntries(ocrRaw).filter(en => en.word && en.example);
+function saveEntries(entries, failedCount) {
   entries.forEach(en => {
     const entry = { id: Date.now() + '-' + Math.random().toString(36).slice(2, 7), word: en.word, example: en.example, createdAt: Date.now() };
     allWords.push(entry);
@@ -227,13 +239,15 @@ function showReview(dataUrl) {
   render(`
     <div class="card">
       <div class="empty">✅ ${entries.length}개 단어를 찾아 저장했어요!</div>
-      ${entries.length ? previewHtml : '<div class="empty">단어를 찾지 못했어요. 더 선명한 사진으로 다시 찍어보세요.</div>'}
+      ${failedCount ? `<div class="empty">⚠️ ${failedCount}장은 인식에 실패했어요</div>` : ''}
+      ${entries.length ? previewHtml : '<div class="empty">단어를 찾지 못했어요. 더 선명한 사진으로 다시 시도해보세요.</div>'}
       <div style="height:6px;"></div>
-      <button class="btn btn-primary" onclick="goCapture()">📸 계속 찍기</button>
+      <button class="btn btn-primary" onclick="goCapture()">📸 계속 찍기 / 선택하기</button>
       <button class="btn btn-secondary" onclick="goQuizSetup()">✏️ 바로 퀴즈 풀기</button>
       <button class="btn btn-secondary" onclick="goHome()">처음으로</button>
     </div>
   `);
+}
 }
 
 function goWordBank() {
