@@ -73,6 +73,13 @@
   .result-label { color:#5A6B85; font-size:14px; margin-bottom:20px; text-align:center; }
   .empty { text-align:center; color:#7A8AA3; font-size:14px; padding:20px 0; }
   .link-back { display:inline-block; margin-bottom:10px; color:var(--sky-dark); font-weight:700; font-size:13.5px; cursor:pointer; }
+  .quiz-topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
+  .quiz-topbar .link-back { margin-bottom:0; }
+  .wordbank-toolbar { display:flex; gap:8px; margin-bottom:12px; }
+  .wordbank-toolbar .btn { margin-top:0; }
+  .word-row input[type=checkbox] { width:19px; height:19px; margin-right:10px; flex-shrink:0; }
+  .word-row { align-items:flex-start; }
+  .word-row .wr-left { display:flex; align-items:flex-start; }
 </style>
 </head>
 <body>
@@ -217,6 +224,7 @@ async function processPhotos(dataUrls) {
       continue;
     }
     let photoRaw = [];
+    let pendingWords = []; // 구간 경계에서 예문을 못 찾은 단어 — 다음 구간 맨 앞 예문과 이어붙임
     for (let j = 0; j < bands.length; j++) {
       render(`
         <div class="card">
@@ -246,9 +254,20 @@ async function processPhotos(dataUrls) {
 
         const words = extractWords(leftText);
         const examples = extractExamples(rightText);
+
+        // 이전 구간에서 예문을 못 찾은 단어를, 이번 구간 맨 앞 예문(들)과 먼저 짝지어요
+        while (pendingWords.length > 0 && examples.length > 0) {
+          const w = pendingWords.shift();
+          const ex = examples.shift();
+          allEntries.push({ word: w, example: ex });
+        }
+
         const count = Math.min(words.length, examples.length);
         for (let k = 0; k < count; k++) {
           if (words[k] && examples[k]) allEntries.push({ word: words[k], example: examples[k] });
+        }
+        if (words.length > count) {
+          pendingWords = pendingWords.concat(words.slice(count));
         }
       } catch (err) {
         // 이 구간만 건너뛰고 계속 진행
@@ -277,7 +296,13 @@ function extractWords(text) {
 }
 
 function extractExamples(text) {
-  const normalized = text.replace(/\{/g, '[').replace(/\}/g, ']');
+  let normalized = text.replace(/\{/g, '[').replace(/\}/g, ']');
+  // 여는 대괄호는 있는데 닫는 대괄호가 없이 세로 막대(|)나 느낌표성 기호로 잘못 읽힌 경우 보정
+  normalized = normalized.replace(/\[([^\[\]]*?)[|!](?=\s*(\n|$))/g, '[$1]');
+  // 그래도 안 닫힌 대괄호가 있으면, 같은 줄 끝을 닫는 것으로 간주
+  normalized = normalized.replace(/\[([^\[\]\n]*?)$/gm, (match, inner) => {
+    return inner.trim().length > 0 ? `[${inner}]` : match;
+  });
   const bracketRegex = /\[([^\[\]]+)\]/g;
   const examples = [];
   let m;
@@ -313,18 +338,52 @@ function saveEntries(entries, failedCount, rawTexts) {
 }
 
 function goWordBank() {
-  const rows = allWords.slice().reverse().map(w => `
+  const sorted = allWords.slice().reverse();
+  const rows = sorted.map(w => `
     <div class="word-row">
-      <div><div class="w">${esc(w.word)}</div><div class="e">${esc(w.example)}</div></div>
+      <div class="wr-left">
+        <input type="checkbox" class="wb-check" data-id="${w.id}">
+        <div><div class="w">${esc(w.word)}</div><div class="e">${esc(w.example)}</div></div>
+      </div>
       <button class="del-btn" onclick="deleteWord('${w.id}')">삭제</button>
     </div>
   `).join('');
   render(`
     <span class="link-back" onclick="goHome()">← 처음으로</span>
     <div class="card">
-      ${allWords.length ? rows : '<div class="empty">아직 저장된 단어가 없어요. 사진을 찍어보세요!</div>'}
+      ${allWords.length ? `
+        <div class="wordbank-toolbar">
+          <button class="btn btn-secondary" onclick="toggleSelectAll()">전체 선택/해제</button>
+          <button class="btn btn-secondary" style="color:var(--coral);" onclick="deleteSelectedWords()">선택 삭제</button>
+        </div>
+        ${rows}
+        <button class="btn btn-secondary" style="color:var(--coral);margin-top:14px;" onclick="deleteAllWords()">전체 삭제</button>
+      ` : '<div class="empty">아직 저장된 단어가 없어요. 사진을 찍어보세요!</div>'}
     </div>
   `);
+}
+
+function toggleSelectAll() {
+  const boxes = document.querySelectorAll('.wb-check');
+  const allChecked = Array.from(boxes).every(b => b.checked);
+  boxes.forEach(b => { b.checked = !allChecked; });
+}
+
+function deleteSelectedWords() {
+  const boxes = document.querySelectorAll('.wb-check:checked');
+  if (boxes.length === 0) { alert('삭제할 단어를 먼저 선택해주세요'); return; }
+  if (!confirm(`선택한 ${boxes.length}개 단어를 삭제할까요?`)) return;
+  const idsToDelete = new Set(Array.from(boxes).map(b => b.dataset.id));
+  allWords = allWords.filter(w => !idsToDelete.has(w.id));
+  saveBank();
+  goWordBank();
+}
+
+function deleteAllWords() {
+  if (!confirm('저장된 단어를 전부 삭제할까요? 되돌릴 수 없어요.')) return;
+  allWords = [];
+  saveBank();
+  goWordBank();
 }
 
 function deleteWord(id) {
@@ -384,6 +443,10 @@ function renderQuizQuestion() {
     return `<div class="quiz-sentence-line">${blanked}</div>`;
   }).join('');
   render(`
+    <div class="quiz-topbar">
+      <span class="link-back" onclick="confirmQuitQuiz()">← 홈으로</span>
+      <span class="link-back" onclick="skipQuestion()">다음 문제 건너뛰기 →</span>
+    </div>
     <div class="card">
       <div class="quiz-progress">문제 ${quizIndex + 1} / ${quizList.length}${q.examples.length > 1 ? ` · 예문 ${q.examples.length}개` : ''}</div>
       <div class="quiz-sentence">${sentencesHtml}</div>
@@ -398,6 +461,16 @@ function renderQuizQuestion() {
     btn.addEventListener('click', () => selectAnswer(opt, q.word));
     optionsEl.appendChild(btn);
   });
+}
+
+function confirmQuitQuiz() {
+  if (confirm('퀴즈를 그만두고 홈으로 갈까요? 지금까지의 점수는 저장되지 않아요.')) goHome();
+}
+
+function skipQuestion() {
+  quizIndex++;
+  if (quizIndex < quizList.length) renderQuizQuestion();
+  else renderQuizResult();
 }
 
 function selectAnswer(chosen, answer) {
