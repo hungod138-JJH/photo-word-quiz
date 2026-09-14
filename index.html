@@ -144,68 +144,96 @@ function readAsDataUrl(file) {
   });
 }
 
-function preprocessImage(dataUrl, maxW) {
+function preprocessAndSplit(dataUrl, maxW, targetBandHeight) {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       const scale = Math.min(1, maxW / img.width);
       const w = Math.max(1, Math.round(img.width * scale));
       const h = Math.max(1, Math.round(img.height * scale));
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, w, h);
-      const imgData = ctx.getImageData(0, 0, w, h);
+      const main = document.createElement('canvas');
+      main.width = w;
+      main.height = h;
+      const mctx = main.getContext('2d');
+      mctx.drawImage(img, 0, 0, w, h);
+
+      // 흑백 + 대비 강화 (배경 비침/형광펜 얼룩 노이즈 완화)
+      const imgData = mctx.getImageData(0, 0, w, h);
       const data = imgData.data;
-      const contrast = 1.5; // 1보다 크면 대비 강화 (배경 비침/형광펜 노이즈 완화)
-      for (let i = 0; i < data.length; i += 4) {
-        const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      const contrast = 1.5;
+      for (let p = 0; p < data.length; p += 4) {
+        const gray = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
         let v = (gray - 150) * contrast + 150;
         v = Math.max(0, Math.min(255, v));
-        data[i] = data[i + 1] = data[i + 2] = v;
+        data[p] = data[p + 1] = data[p + 2] = v;
       }
-      ctx.putImageData(imgData, 0, 0);
-      resolve(canvas.toDataURL('image/jpeg', 0.92));
+      mctx.putImageData(imgData, 0, 0);
+
+      // 세로로 긴 사진은 여러 구간으로 나눠서 각각 인식 (한 번에 넣으면 아래쪽을 건너뛰는 경우가 있어요)
+      const bandCount = Math.max(1, Math.round(h / targetBandHeight));
+      const bandH = Math.ceil(h / bandCount);
+      const bands = [];
+      for (let i = 0; i < bandCount; i++) {
+        const y = i * bandH;
+        const bh = Math.min(bandH, h - y);
+        if (bh <= 0) continue;
+        const bandCanvas = document.createElement('canvas');
+        bandCanvas.width = w;
+        bandCanvas.height = bh;
+        bandCanvas.getContext('2d').drawImage(main, 0, y, w, bh, 0, 0, w, bh);
+        bands.push(bandCanvas.toDataURL('image/jpeg', 0.92));
+      }
+      resolve(bands);
     };
     img.src = dataUrl;
   });
 }
 
 async function processPhotos(dataUrls) {
-  const total = dataUrls.length;
+  const totalPhotos = dataUrls.length;
   let allEntries = [];
   let failedCount = 0;
   let rawTexts = [];
 
-  for (let i = 0; i < total; i++) {
-    render(`
-      <div class="card">
-        <img id="preview" src="${dataUrls[i]}">
-        <div class="status">
-          <div class="spinner"></div>
-          <div id="ocrMsg">사진 속 글자를 읽는 중이에요 (${i + 1} / ${total})</div>
-          <div class="progress-bar"><div class="progress-fill" id="ocrBar" style="width:0%"></div></div>
-        </div>
-      </div>
-    `);
+  for (let i = 0; i < totalPhotos; i++) {
+    let bands;
     try {
-      const small = await preprocessImage(dataUrls[i], 1600);
-      const result = await Tesseract.recognize(small, 'eng', {
-        logger: (m) => {
-          if (m.status === 'recognizing text') {
-            const bar = document.getElementById('ocrBar');
-            if (bar) bar.style.width = Math.round(m.progress * 100) + '%';
-          }
-        }
-      });
-      const rawText = result.data.text.trim();
-      rawTexts.push(rawText);
-      const entries = parseMultipleEntries(rawText).filter(en => en.word && en.example);
-      allEntries = allEntries.concat(entries);
+      bands = await preprocessAndSplit(dataUrls[i], 1300, 550);
     } catch (err) {
       failedCount++;
+      continue;
     }
+    let photoRaw = [];
+    for (let j = 0; j < bands.length; j++) {
+      render(`
+        <div class="card">
+          <img id="preview" src="${dataUrls[i]}">
+          <div class="status">
+            <div class="spinner"></div>
+            <div id="ocrMsg">사진 속 글자를 읽는 중이에요 (${i + 1}/${totalPhotos}장 · 구간 ${j + 1}/${bands.length})</div>
+            <div class="progress-bar"><div class="progress-fill" id="ocrBar" style="width:0%"></div></div>
+          </div>
+        </div>
+      `);
+      try {
+        const result = await Tesseract.recognize(bands[j], 'eng', {
+          logger: (m) => {
+            if (m.status === 'recognizing text') {
+              const bar = document.getElementById('ocrBar');
+              if (bar) bar.style.width = Math.round(m.progress * 100) + '%';
+            }
+          }
+        });
+        const bandText = result.data.text.trim();
+        photoRaw.push(bandText);
+        // 구간별로 바로 단어-예문을 매칭해서, 한 구간의 OCR 오류가 다른 구간 결과까지 밀리게 하지 않아요
+        const entries = parseMultipleEntries(bandText).filter(en => en.word && en.example);
+        allEntries = allEntries.concat(entries);
+      } catch (err) {
+        // 이 구간만 건너뛰고 계속 진행
+      }
+    }
+    rawTexts.push(photoRaw.join('\n---\n'));
   }
 
   saveEntries(allEntries, failedCount, rawTexts);
@@ -213,14 +241,18 @@ async function processPhotos(dataUrls) {
 
 function guessWordAndExampleFallback(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  if (lines.length === 0) return { word: '', example: '' };
-  let wordLine = lines.find(l => l.split(/\s+/).length <= 2) || lines[0];
+  if (lines.length < 2) return null;
+  let wordLine = lines.find(l => l.split(/\s+/).length <= 2);
+  if (!wordLine) return null;
   const word = wordLine.replace(/[^a-zA-Z' ]/g, '').trim().split(/\s+/)[0] || '';
-  const exampleLine = lines.find(l => l !== wordLine && l.split(/\s+/).length >= 3) || lines.join(' ');
+  const exampleLine = lines.find(l => l !== wordLine && l.split(/\s+/).length >= 4);
+  if (!word || word.length < 2 || !exampleLine) return null;
   return { word, example: exampleLine };
 }
 
-function parseMultipleEntries(text) {
+function parseMultipleEntries(rawText) {
+  // OCR이 대괄호 [ ] 를 중괄호 { } 로 잘못 읽는 경우가 많아 보정
+  const text = rawText.replace(/\{/g, '[').replace(/\}/g, ']');
   const wordRegex = /\b([A-Za-z][A-Za-z'\-]{1,20})\s*[^\w\s(]{0,3}\s*\(\s*(v\.?|n\.?|adj\.?|adv\.?|prep\.?|conj\.?|pron\.?|interj\.?)\s*\)/gi;
   const words = [];
   let m;
@@ -232,7 +264,8 @@ function parseMultipleEntries(text) {
   while ((m2 = bracketRegex.exec(text)) !== null) examples.push(m2[1].trim().replace(/\s+/g, ' '));
 
   if (words.length === 0 && examples.length === 0) {
-    return [guessWordAndExampleFallback(text)];
+    const guess = guessWordAndExampleFallback(text);
+    return guess ? [guess] : [];
   }
   const count = Math.max(words.length, examples.length);
   const pairs = [];
